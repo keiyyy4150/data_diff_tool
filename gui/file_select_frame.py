@@ -12,19 +12,23 @@ class FileSelectFrame(tk.Frame):
         self.create_widgets()
 
     def create_widgets(self):
-        tk.Label(self, text="比較元ファイル:").grid(row=0, column=0, sticky="w")
+        # 初期値を設定
+        self.shared["start_row1"].set(1)
+        self.shared["start_row2"].set(1)
+
+        tk.Label(self, text="比較元ファイルパス:").grid(row=0, column=0, sticky="w")
         tk.Entry(self, textvariable=self.shared["file1_path"], width=50).grid(row=0, column=1, sticky="w")
         tk.Button(self, text="参照", command=lambda: self.select_file("file1_path")).grid(row=0, column=2)
 
-        tk.Label(self, text="開始行（比較元）:").grid(row=1, column=0, sticky="w")
-        tk.Entry(self, textvariable=self.shared["start_row1"]).grid(row=1, column=1, sticky="w")
+        tk.Label(self, text="ヘッダー行:").grid(row=1, column=0, sticky="w")
+        tk.Entry(self, textvariable=self.shared["start_row1"], width=5).grid(row=1, column=1, sticky="w")
 
-        tk.Label(self, text="比較先ファイル:").grid(row=2, column=0, sticky="w")
+        tk.Label(self, text="比較先ファイルパス:").grid(row=2, column=0, sticky="w")
         tk.Entry(self, textvariable=self.shared["file2_path"], width=50).grid(row=2, column=1, sticky="w")
         tk.Button(self, text="参照", command=lambda: self.select_file("file2_path")).grid(row=2, column=2)
 
-        tk.Label(self, text="開始行（比較先）:").grid(row=3, column=0, sticky="w")
-        tk.Entry(self, textvariable=self.shared["start_row2"]).grid(row=3, column=1, sticky="w")
+        tk.Label(self, text="ヘッダー行:").grid(row=3, column=0, sticky="w")
+        tk.Entry(self, textvariable=self.shared["start_row2"], width=5).grid(row=3, column=1, sticky="w")
 
         tk.Button(self, text="終了", command=self.app.root.quit).grid(row=4, column=1, sticky="e", pady=10)
         tk.Button(self, text="次へ", command=self.load_files).grid(row=4, column=2, sticky="w")
