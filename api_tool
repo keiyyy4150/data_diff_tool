@@ -1,0 +1,385 @@
+Param(
+    [string]$IniPath = "/root/ini/settings.ini",
+    [string]$ProcessStatusPath = "/root/csvFiles/process_status.csv"
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+### ========== 共通: INI/ログ/状態管理/HTTP ==========
+
+function Read-Ini {
+    param([string]$Path)
+    $ini = @{}
+    $section = ""
+    Get-Content -LiteralPath $Path | ForEach-Object {
+        $line = $_.Trim()
+        if ($line -match '^\s*[;#]') { return }
+        if ($line -match '^\s*\[(.+?)\]\s*$') {
+            $section = $matches[1]
+            if (-not $ini.ContainsKey($section)) { $ini[$section] = @{} }
+        } elseif ($line -match '^\s*([^=]+?)\s*=\s*(.*)\s*$' -and $section) {
+            $key = $matches[1].Trim()
+            $val = $matches[2].Trim()
+            $ini[$section][$key] = $val
+        }
+    }
+    return $ini
+}
+
+$INI = Read-Ini -Path $IniPath
+
+$BaseUrl   = $INI.ENV.BaseUrl
+$TenantId  = $INI.ENV.TenantId
+$ApiToken  = $INI.ENV.ApiToken
+
+$BinderId       = $INI.SMARTDB.BinderId
+$ListPartCode   = $INI.SMARTDB.ListPartCode
+$MainCsvTpl     = $INI.SMARTDB.MainCsvTemplate
+$ListCsvTpl     = $INI.SMARTDB.ListCsvTemplate
+
+$CsvRoot = $INI.PATH.CsvRoot
+$InTemp  = $INI.PATH.InTemp
+$InBk    = $INI.PATH.InBk
+$OutTemp = $INI.PATH.OutTemp
+$OutBk   = $INI.PATH.OutBk
+$LogDir  = $INI.PATH.Log
+
+$TimeoutSec = [int]$INI.RUN.TimeoutSec
+$MaxRetry   = [int]$INI.RUN.MaxRetry
+$RetryWait  = [int]$INI.RUN.RetryIntervalSec
+
+if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir | Out-Null }
+$LogPath = Join-Path $LogDir ("log_{0}.log" -f (Get-Date -Format "yyyyMMdd"))
+
+function Write-Log {
+    param([string]$Message, [string]$Level = "INFO")
+    $line = "[{0}] [{1}] {2}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Level, $Message
+    $line | Tee-Object -FilePath $LogPath -Append
+}
+
+function Read-ProcessStatus {
+    param([string]$Path)
+    if (-not (Test-Path $Path)) {
+        "step,lastDocumentId,status,errorMessage,updatedAt`n0,,READY,,{0}" -f (Get-Date -Format o) |
+            Set-Content -LiteralPath $Path -Encoding UTF8
+    }
+    $row = Import-Csv -LiteralPath $Path | Select-Object -First 1
+    return $row
+}
+
+function Update-ProcessStatus {
+    param(
+        [int]$Step,
+        [string]$LastDocumentId = "",
+        [string]$Status = "RUNNING",
+        [string]$ErrorMessage = ""
+    )
+    $obj = [PSCustomObject]@{
+        step          = $Step
+        lastDocumentId= $LastDocumentId
+        status        = $Status
+        errorMessage  = $ErrorMessage
+        updatedAt     = (Get-Date -Format o)
+    }
+    $obj | Export-Csv -LiteralPath $ProcessStatusPath -NoTypeInformation -Encoding UTF8
+    Write-Log ("ProcessStatus -> step:{0}, status:{1}, lastId:{2}, msg:{3}" -f $Step, $Status, $LastDocumentId, $ErrorMessage)
+}
+
+function Invoke-SmartDB {
+    param(
+        [ValidateSet('GET','POST','PUT','DELETE')] [string]$Method,
+        [string]$Url,
+        [hashtable]$Headers = $null,
+        [object]$Body = $null,
+        [int]$Retry = $MaxRetry
+    )
+    if (-not $Headers) { $Headers = @{} }
+    $Headers["Authorization"] = "Bearer $ApiToken"
+    $Headers["X-Tenant-Id"]   = $TenantId
+
+    for ($i=1; $i -le $Retry; $i++) {
+        try {
+            Write-Log ("HTTP {0} {1} try{2}" -f $Method, $Url, $i)
+            if ($Body -and ($Method -in @('POST','PUT'))) {
+                return Invoke-RestMethod -Method $Method -Uri $Url -Headers $Headers -Body ($Body | ConvertTo-Json -Depth 8) -ContentType "application/json" -TimeoutSec $TimeoutSec
+            } else {
+                return Invoke-RestMethod -Method $Method -Uri $Url -Headers $Headers -TimeoutSec $TimeoutSec
+            }
+        } catch {
+            Write-Log ("HTTP Error: {0}" -f $_.Exception.Message) "ERROR"
+            if ($i -lt $Retry) { Start-Sleep -Seconds $RetryWait } else { throw }
+        }
+    }
+}
+
+### ========== ① 文書一覧CSV出力（受領→input temp保存） ==========
+
+function Request-ExportDocumentCsv {
+    param([string]$BinderId)
+    # TODO: 実エンドポイント/クエリに置き換え
+    $url = "$BaseUrl/binders/$BinderId/documents:exportCsv"
+    $res = Invoke-SmartDB -Method POST -Url $url -Body @{ format="csv" }
+    # ここではレスポンスにCSVバイト or 一時URLが返る想定で分岐
+    if ($res.downloadUrl) {
+        $csv = Invoke-WebRequest -Uri $res.downloadUrl -Headers @{ Authorization="Bearer $ApiToken" } -TimeoutSec $TimeoutSec
+        return $csv.Content
+    } elseif ($res.csvBase64) {
+        return [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($res.csvBase64))
+    } else {
+        throw "CSVレスポンス形式が不明"
+    }
+}
+
+function Save-InputCsv {
+    param([string]$CsvText)
+    if (-not (Test-Path $InTemp)) { New-Item -ItemType Directory -Path $InTemp | Out-Null }
+    $file = Join-Path $InTemp ("input_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+    $CsvText | Set-Content -LiteralPath $file -Encoding UTF8
+    Write-Log "Input CSV saved: $file"
+    return $file
+}
+
+### ========== ③ 重複チェック（期間×カテゴリ） ==========
+
+function Get-PeriodOverlap {
+    param([datetime]$S1,[datetime]$E1,[datetime]$S2,[datetime]$E2)
+    return ($S1 -le $E2) -and ($S2 -le $E1)
+}
+
+function Find-Duplicates {
+    param([string]$InputCsvPath)
+
+    $rows = Import-Csv -LiteralPath $InputCsvPath
+    # 例: IsSourceFlag=1 を「重複チェック元」、0 を「重複チェック先」
+    $src = $rows | Where-Object { $_.IsSourceFlag -eq '1' }
+    $tgt = $rows | Where-Object { $_.IsSourceFlag -eq '0' }
+
+    $dups = New-Object System.Collections.Generic.List[object]
+
+    foreach ($s in $src) {
+        $sS = [datetime]$s.StartDate
+        $sE = [datetime]$s.EndDate
+        $cat = $s.Category
+
+        $hits = $tgt | Where-Object {
+            $_.Category -eq $cat -and
+            (Get-PeriodOverlap -S1 $sS -E1 $sE -S2 ([datetime]$_.StartDate) -E2 ([datetime]$_.EndDate))
+        }
+        foreach ($h in $hits) {
+            $dups.Add([PSCustomObject]@{
+                SourceDocumentId   = $s.DocumentId
+                TargetDocumentId   = $h.DocumentId
+                Category           = $cat
+                SrcStartDate       = $sS.ToString("yyyy-MM-dd")
+                SrcEndDate         = $sE.ToString("yyyy-MM-dd")
+                TgtStartDate       = ([datetime]$h.StartDate).ToString("yyyy-MM-dd")
+                TgtEndDate         = ([datetime]$h.EndDate).ToString("yyyy-MM-dd")
+                Reason             = "期間重複 & カテゴリ一致"
+            })
+        }
+    }
+    return $dups
+}
+
+### ========== ④ アウトプットCSV（メイン／リスト部品）作成 ==========
+
+function Build-MainCsv {
+    param($Duplicates, [string]$TemplatePath, [string]$OutDir)
+    if (-not (Test-Path $OutDir)) { New-Item -ItemType Directory -Path $OutDir | Out-Null }
+
+    $out = Join-Path $OutDir ("main_update_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+    # 例：テンプレを読み込み列構成を踏襲
+    $tpl = Import-Csv -LiteralPath $TemplatePath
+    $rows = foreach ($d in $Duplicates) {
+        # TODO: SmartDBのメインフォーム更新に必要な列名へマップ
+        [PSCustomObject]@{
+            DocumentId   = $d.TargetDocumentId
+            DupFlag      = "1"
+            DupNote      = "src=" + $d.SourceDocumentId
+        }
+    }
+    $rows | Export-Csv -LiteralPath $out -NoTypeInformation -Encoding UTF8
+    Write-Log "Main CSV built: $out"
+    return $out
+}
+
+function Build-ListCsv {
+    param($Duplicates, [string]$TemplatePath, [string]$OutDir)
+    if (-not (Test-Path $OutDir)) { New-Item -ItemType Directory -Path $OutDir | Out-Null }
+
+    $out = Join-Path $OutDir ("list_rows_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+    $tpl = Import-Csv -LiteralPath $TemplatePath
+    $rows = foreach ($d in $Duplicates) {
+        # TODO: SmartDBリスト部品の列構成に合わせる
+        [PSCustomObject]@{
+            DocumentId = $d.TargetDocumentId
+            PartCode   = $ListPartCode
+            ColCategory= $d.Category
+            ColSrcId   = $d.SourceDocumentId
+            ColReason  = $d.Reason
+        }
+    }
+    $rows | Export-Csv -LiteralPath $out -NoTypeInformation -Encoding UTF8
+    Write-Log "List CSV built: $out"
+    return $out
+}
+
+### ========== ⑤ リスト部品 行削除（全削除 or 条件削除） ==========
+
+function Clear-ListPartRows {
+    param([string]$DocumentId,[string]$PartCode)
+    # TODO: 実エンドポイントへ置換
+    $url = "$BaseUrl/documents/$DocumentId/parts/$PartCode/rows:deleteAll"
+    $res = Invoke-SmartDB -Method POST -Url $url
+    return $true
+}
+
+### ========== ⑥ リスト部品 行新規登録（途中再開対応） ==========
+
+function Add-ListRows {
+    param(
+        [string]$ListCsvPath,
+        [string]$ResumeAfterDocumentId = ""
+    )
+    $rows = Import-Csv -LiteralPath $ListCsvPath
+
+    $start = $true
+    if ($ResumeAfterDocumentId) { $start = $false }
+
+    foreach ($r in $rows) {
+        $docId = $r.DocumentId
+
+        if (-not $start) {
+            if ($docId -eq $ResumeAfterDocumentId) {
+                # 直前成功IDを見つけたので、次から処理開始
+                $start = $true
+                continue
+            } else {
+                continue
+            }
+        }
+
+        # 行登録
+        # TODO: 実エンドポイントへ置換
+        $url = "$BaseUrl/documents/$docId/parts/$($r.PartCode)/rows"
+        $body = @{
+            rows = @(@{
+                ColCategory = $r.ColCategory
+                ColSrcId    = $r.ColSrcId
+                ColReason   = $r.ColReason
+            })
+        }
+        Invoke-SmartDB -Method POST -Url $url -Body $body | Out-Null
+
+        # 成功したらlastDocumentId更新（再開ポイント）
+        Update-ProcessStatus -Step 4 -LastDocumentId $docId -Status "RUNNING"
+    }
+    return $true
+}
+
+### ========== ⑦ メインCSVの一括更新（CSV入力） ==========
+
+function Import-MainCsv {
+    param([string]$MainCsvPath)
+    # TODO: 実エンドポイントへ置換（CSV取込API or バインダCSV更新API）
+    $url = "$BaseUrl/binders/$BinderId/documents:importCsv"
+    # SmartDB側がmultipart/form-dataを要求する場合は別実装に
+    $csvText = Get-Content -LiteralPath $MainCsvPath -Raw -Encoding UTF8
+    $body = @{
+        csvText  = $csvText
+        updateMode = "UPDATE"
+    }
+    Invoke-SmartDB -Method POST -Url $url -Body $body | Out-Null
+    return $true
+}
+
+### ========== ファイル退避ユーティリティ ==========
+
+function Move-To-Backup {
+    param([string]$Path,[string]$BkDir)
+    if (-not (Test-Path $BkDir)) { New-Item -ItemType Directory -Path $BkDir | Out-Null }
+    $dest = Join-Path $BkDir (Split-Path $Path -Leaf)
+    Move-Item -LiteralPath $Path -Destination $dest -Force
+    Write-Log "Moved -> $dest"
+}
+
+### ========== メインフロー（再開対応） ==========
+
+try {
+    Write-Log "=== START ==="
+    $st = Read-ProcessStatus -Path $ProcessStatusPath
+    Update-ProcessStatus -Step ([int]$st.step) -LastDocumentId $st.lastDocumentId -Status "RUNNING"
+
+    # STEP 1: 文書一覧CSV出力 -> input temp 保存
+    if ([int]$st.step -lt 1) {
+        $csvText = Request-ExportDocumentCsv -BinderId $BinderId
+        $inputCsv = Save-InputCsv -CsvText $csvText
+        Update-ProcessStatus -Step 1 -Status "RUNNING"
+    } else {
+        # 直近を再利用（tempの最新を拾う想定）
+        $inputCsv = Get-ChildItem -LiteralPath $InTemp -Filter "input_*.csv" | Sort-Object LastWriteTime -Descending | Select-Object -First 1 | ForEach-Object { $_.FullName }
+        if (-not $inputCsv) { throw "入力CSVが見つかりません（再開時）" }
+    }
+
+    # STEP 2: 重複検出 → メモリ保持（または中間CSV）
+    if ([int]$st.step -lt 2) {
+        $dups = Find-Duplicates -InputCsvPath $inputCsv
+        # 入力ファイルは問題なければ bk へ
+        Move-To-Backup -Path $inputCsv -BkDir $InBk
+        Update-ProcessStatus -Step 2 -Status "RUNNING"
+    } else {
+        # 再開時は直近out tempのlist/main生成をやり直す
+        $dups = Find-Duplicates -InputCsvPath $inputCsv
+    }
+
+    # STEP 4用ファイル生成（STEP 3は後で実行）
+    $listCsv = Build-ListCsv -Duplicates $dups -TemplatePath $ListCsvTpl -OutDir $OutTemp
+    $mainCsv = Build-MainCsv -Duplicates $dups -TemplatePath $MainCsvTpl -OutDir $OutTemp
+
+    # STEP 3: リスト部品を一旦クリア
+    if ([int]$st.step -lt 3) {
+        # 対象文書のユニーク一覧
+        $targetDocIds = ($dups | Select-Object -ExpandProperty TargetDocumentId -Unique)
+        foreach ($id in $targetDocIds) {
+            Clear-ListPartRows -DocumentId $id -PartCode $ListPartCode | Out-Null
+        }
+        Update-ProcessStatus -Step 3 -Status "RUNNING"
+    }
+
+    # STEP 4: リスト部品 行新規登録（途中再開ポイントはlastDocumentId）
+    $resumeId = if ([int]$st.step -eq 4) { $st.lastDocumentId } else { "" }
+    Add-ListRows -ListCsvPath $listCsv -ResumeAfterDocumentId $resumeId | Out-Null
+    Update-ProcessStatus -Step 4 -LastDocumentId "" -Status "RUNNING"
+
+    # STEP 5: メインCSVの一括更新
+    if ([int]$st.step -lt 5) {
+        Import-MainCsv -MainCsvPath $mainCsv | Out-Null
+        Update-ProcessStatus -Step 5 -Status "RUNNING"
+    }
+
+    # STEP 8: 正常終了 → out temp を bk へ
+    Move-To-Backup -Path $listCsv -BkDir $OutBk
+    Move-To-Backup -Path $mainCsv -BkDir $OutBk
+    Update-ProcessStatus -Step 9 -Status "DONE"
+    Write-Log "=== END (SUCCESS) ==="
+}
+catch {
+    $msg = $_.Exception.Message
+    Write-Log "FATAL: $msg" "ERROR"
+
+    # どの段階で失敗したかで step を設定
+    # 原則: 直前の成功stepを保持したまま、エラーstep番号を process_status に残す
+    $curr = Read-ProcessStatus -Path $ProcessStatusPath
+    $failedStep =
+        if ([int]$curr.step -lt 1) { 1 }
+        elseif ([int]$curr.step -lt 2) { 2 }
+        elseif ([int]$curr.step -lt 3) { 3 }
+        elseif ([int]$curr.step -lt 4) { 4 }
+        elseif ([int]$curr.step -lt 5) { 5 }
+        else { [int]$curr.step }
+
+    Update-ProcessStatus -Step $failedStep -LastDocumentId $curr.lastDocumentId -Status "ERROR" -ErrorMessage $msg
+    Write-Log "=== END (ERROR) ===" "ERROR"
+    exit 1
+}
