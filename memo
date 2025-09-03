@@ -1,4 +1,4 @@
-dispatch_by_seq_and_item.ps1
+dispatchBySeqAndItem.ps1
 
 param(
   [Parameter(Mandatory=$true)][string]$CsvPath,     # CSV: SEQ,項目名1,項目名2,...
