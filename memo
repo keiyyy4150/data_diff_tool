@@ -1,3 +1,5 @@
+dispatch_by_seq_and_item.ps1
+
 param(
   [Parameter(Mandatory=$true)][string]$CsvPath,     # CSV: SEQ,項目名1,項目名2,...
   [Parameter(Mandatory=$true)][string]$SourceDir,   # 実ファイルが全てある場所（Downloads など）
