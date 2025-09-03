@@ -78,3 +78,16 @@ if ($errors.Count -gt 0) {
   Write-Warning "エラー一覧: $er"
 }
 Write-Host "完了。"
+
+
+
+
+
+
+
+
+powershell -NoProfile -ExecutionPolicy Bypass -File "C:\path\dispatch_by_seq_and_item.ps1" ^
+  -CsvPath "C:\path\list.csv" ^
+  -SourceDir "C:\Users\%USERNAME%\Downloads" ^
+  -TargetBase "D:\Work\OutputRoot" ^
+  -Move:$false
