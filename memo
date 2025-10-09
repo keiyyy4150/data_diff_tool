@@ -1,55 +1,145 @@
-見積もりを出すためには、以下の要素を考慮します：
+OK、ここはSafeEvalを一旦“使わない”方針に切り替えるのが最速で確実です。
+ご要望の「Definitions側で SUM(...) を書けるようにする」＋「四則演算行は Excel の Evaluate に投げる（失敗時のみ SafeEval にフォールバック）」の2段構えにしましょう。これでいまの落ちを回避しつつ、②の加算も安定して通ります。
 
 ⸻
 
-1. ログ1行あたりのサイズ想定
+1) SUM() を Definitions から使えるようにする（新規関数）
 
-ログに出力するフォーマットを仮定します。例えば：
+使い方（Definitions）
 
-id=12345, 処理名称=受注データ取込, 処理id=98765
+SUM({tbl.col1}, {tbl.col2}, {tbl2.colA}, "30", "20")
 
-	•	id: 数字10桁程度 → 10バイト
-	•	区切りや日本語文字列（処理名称）: 20～40バイト程度（文字コードによる）
-	•	Shift-JISなら1文字2バイト、UTF-8なら日本語1文字あたり3バイト程度
-	•	全体で1行 ≈ 50〜100バイト 程度
+→ 文字列数値やトークンを混ぜてOK。空や非数値は0扱い。
+
+差し込みコード（modJoinAndEval）
+EvaluateExpr の「Else（式）」分岐の直前に SUM( 判定を入れ、合計します。
+
+'=== ユーティリティ: 数値化（既存 ToNumberOrZero を流用）
+Private Function NumVal(ByVal s As String) As Double
+    NumVal = CDbl(Val(ToNumberOrZero(s)))
+End Function
+
+'=== SUM( … ) の評価
+Private Function EvalSUM(ByVal line As String, baseTbl As String, baseRow As Long, myKey As String, _
+                         ByVal processed As Boolean, ByVal outColIndex As Long) As String
+    Dim inside As String, args As Collection, i As Long, v As String, total As Double
+    inside = Mid$(line, 5, Len(line) - 5) ' "SUM(" の後ろから末尾 ")" まで
+    Set args = SplitArgs(inside)
+    For i = 1 To args.Count
+        ' {tbl.col} / 数字文字列 / リテラル すべて GetScalarValue で解決
+        v = GetScalarValue(args(i), baseTbl, baseRow, myKey, processed, outColIndex)
+        total = total + NumVal(v)
+    Next
+    EvalSUM = CStr(total)
+End Function
+
+そして EvaluateExpr の式分岐をこう変更してください（★印の行を追加）：
+
+Else
+    Dim expr As String, up As String
+    up = UCase$(one)
+
+    ' ★ Definitions で SUM(...) をそのまま使えるように
+    If Left$(up, 4) = "SUM(" And Right$(up, 1) = ")" Then
+        res = EvalSUM(one, baseTbl, baseRow, myKey, processed, outColIndex)
+
+    Else
+        If processed Then
+            expr = ReplaceTokensProcessedAsNumber(one, baseTbl, baseRow, myKey, outColIndex)
+        Else
+            expr = ReplaceTokensWithRaw(one, baseTbl, baseRow, myKey)
+        End If
+
+        ' ★ まずは Excel の Evaluate で計算 → 失敗時のみ SafeEval へ
+        Dim v As Variant
+        On Error Resume Next
+        v = Application.Evaluate("=" & expr)
+        On Error GoTo 0
+        If IsError(v) Or VarType(v) = vbError Or IsEmpty(v) Then
+            res = CStr(SafeEval(expr))
+        Else
+            res = CStr(v)
+        End If
+    End If
+
+    If acc = "" Then acc = res Else acc = acc & vbLf & res
+End If
+
+ポイント
+	•	SUM() はSafeEvalを通さないので落ちません。
+	•	SUMの引数は {tbl.col} でも "100" でもOK（GetScalarValue → ToNumberOrZero で数値化）。
+	•	他の「100+50+…」のような生式は Excel の Evaluate("=" & expr) に投げます。これもパーサを自作しないので堅牢です（小数点は . でOK）。
 
 ⸻
 
-2. 件数 × 文字数
+2) 行末で 0 になる問題の“型整形”を修正（合算版 Finalize）
 
-4000件分だと、
-	•	50バイト × 4000件 = 200,000バイト（約200KB）
-	•	100バイト × 4000件 = 400,000バイト（約400KB）
+複数行（改行区切り）になった時に IsNumeric(acc)=False → 0 になっているので、数値型のときは行ごとに合算する版に戻します（※以前コメントアウトしていた版）。
+
+Private Function FinalizeByType(ByVal s As String, ByVal dataType As String) As String
+    Select Case UCase$(dataType)
+        Case "NUMBER"
+            If Len(s) = 0 Then
+                FinalizeByType = ""
+            Else
+                Dim total As Double, arr() As String, i As Long, one As String
+                s = Replace$(Replace$(s, vbCrLf, vbLf), vbCr, vbLf)
+                arr = Split(s, vbLf)
+                For i = LBound(arr) To UBound(arr)
+                    one = Trim$(arr(i))
+                    If Len(one) > 0 Then total = total + CDbl(Val(ToNumberOrZero(one)))
+                Next
+                FinalizeByType = CStr(CLng(total))
+            End If
+
+        Case "DATE"
+            If Len(s) = 0 Then
+                FinalizeByType = ""
+            ElseIf IsDate(s) Then
+                FinalizeByType = Format$(CDate(s), "yyyy/mm/dd")
+            Else
+                FinalizeByType = ""
+            End If
+
+        Case Else
+            FinalizeByType = s
+    End Select
+End Function
+
+これで、EXPR の1行が 150 でも、複数行で 100 と 50 が分かれていても、最終セルは 150 になります。
 
 ⸻
 
-3. 余白やメタ情報を含めた実際の見積もり
+3) すぐ試せるサンプル（Definitions 例）
 
-実際のログファイルには、以下が追加される場合があります：
-	•	日付時刻（例: [2025-09-08 12:30:45] → 約20バイト）
-	•	改行コード（Windowsは2バイト）
-	•	APIのレスポンスJSONをそのまま出力するケースだと、桁数が一気に増える
+(A) いまの式そのまま（Evaluate 使用）
 
-→ これらを考慮すると 1行あたり100〜150バイト程度 と見ておくのが安全です。
+{pcm_t_...一般懸賞1_6}+{pcm_t_...一般懸賞2_6}+{pcm_t_...一般懸賞3_6}
++{pcm_t_...総付景品1_4}+{pcm_t_...総付景品2_4}+{pcm_t_...総付景品3_4}
 
-⸻
+(B) SUM を使う（おすすめ）
 
-4. 最終見積もり
+SUM(
+  {pcm_t_...一般懸賞1_6},
+  {pcm_t_...一般懸賞2_6},
+  {pcm_t_...一般懸賞3_6},
+  {pcm_t_...総付景品1_4},
+  {pcm_t_...総付景品2_4},
+  {pcm_t_...総付景品3_4}
+)
 
-4000件 × 150バイト = 約600KB
-→ 実際には 200KB〜600KB の範囲に収まる可能性が高いです。
-
-⸻
-
-✅ 結論：
-4000件のログファイルなら、0.2MB〜0.6MB 程度を見積もれば十分。
-安全マージンを見て「1MB以内」と考えておけば安心です。
 
 ⸻
 
-ご質問ですが、ログに
-	•	日付や時刻（タイムスタンプ）
-	•	エラーレベル（INFO/ERROR など）
+4) ①の「カンマ区切り」について（補足）
 
-も付与する予定ですか？
-それがあるともう少しだけ容量が増えます。
+JOIN(", ") ディレクティブ対応は引き続き有効な案ですが、まずは合計が正しく出ることを優先し、今回のパッチ適用後に入れるのが安全です。必要なら、次の返答で JOIN 実装の最小差分もまとめてお渡しします。
+
+⸻
+
+まとめ
+	•	SafeEval が落ちる件は、Excel の Evaluate にオフロードしつつ、SUM 関数をネイティブ対応するのが最短で安定。
+	•	最終の数値型整形は行ごと合算版に置き換え。
+	•	これで「exprは展開されているのに結果が0」問題を解消できます。
+
+この方針で一度貼り替えてみてください。動いたら、①のカンマ区切り（JOIN(", ")）と③の正規化（UCASE/REPLACE）も続けて入れましょう。
